@@ -202,7 +202,7 @@ predictionsXGBCV = as.data.frame(predictionsXGBCV)
 colnames(predictionsXGBCV) <- c("VAL1","VAL2")
 predictionsXGBCV$Observed = subsetDf$label
 predictionsXGBCV$Predicted = lapply(predictionsXGBCV$VAL1, function(x) ifelse(x>0.5, "COVID","nonCOVID"))
-v
+
 predictionsXGBCV
 ```
 
