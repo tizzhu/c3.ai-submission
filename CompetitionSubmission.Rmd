@@ -1,0 +1,411 @@
+---
+title: "c3.ai COVID-19 Competition Submission"
+output: html_notebook
+---
+
+
+Select only genes that have same mean difference direction in both data sets.
+```{r}
+setwd("~/Desktop/COVIDCompetition")
+set.seed(2020.4)
+data1 <- read.delim("GSE157103_genes.tpm.tsv",header = TRUE,sep = "\t")
+data2 <- read.table(file = 'GSE154998_normalized_read_counts.txt', sep = '\t', header = TRUE)
+colnames(data1)[1] = 'symbol'
+colnames(data2)[5] = 'symbol'
+
+GSE157103_control <- data1[,c(1,102:127)]
+GSE157103_covid <- data1[,c(1:101)]
+GSE157103_nonicu <- GSE157103_control[,c(1,2,5,6,10,12,22,23,24,25,26)]
+GSE157103_icu <- GSE157103_control[,c(1,3,4,7,8,9,11,13,14,15,16,17,18,19,20,21,27)]
+GSE157103_control_mean <- rowMeans(GSE157103_control[,2:27])
+GSE157103_covid_mean <- rowMeans(GSE157103_covid[,2:101])
+GSE157103_mean <- cbind(data1['symbol'],GSE157103_control_mean, GSE157103_covid_mean)
+
+GSE154998_control <- data2[c('symbol','CO01_D1','CO09_D1','CO10_D1','CO13_D1B', 'CO19_D1', 'CO30_D1B','CO35_D1')]
+GSE154998_covid <- data2[c('symbol','CO05_D1','CO25_D1X','CO40_D1','CO37_D1', 'CO11_D1', 'CO17_D1','CO22_D1')]
+GSE154998_control_mean <- rowMeans(GSE154998_control[,2:8])
+GSE154998_covid_mean <- rowMeans(GSE154998_covid[,2:8])
+GSE154998_mean <- cbind(data2['symbol'],GSE154998_control_mean, GSE154998_covid_mean)
+
+df_total <- merge(GSE157103_mean,GSE154998_mean,by='symbol')
+df_total$GSE157103_diff <- df_total$GSE157103_control_mean - df_total$GSE157103_covid_mean
+df_total$GSE154998_diff <- df_total$GSE154998_control_mean - df_total$GSE154998_covid_mean
+df_sub <- df_total[df_total$GSE157103_diff * df_total$GSE154998_diff >0,]
+write.csv(df_sub,"genes of the same mean difference direction.csv")
+```
+
+Select only ICU patients from GSE157103
+```{r}
+df <- read.delim("GSE157103_genes.tpm.tsv",header = TRUE,sep = "\t",row.names = 1)
+df = as.data.frame(t(df))
+info <- read.csv("patients_info.csv",header = TRUE)
+info <- info[match(row.names(df),info$Albany_sampleID),]
+df_icu <- df[which(info$ICU_1 ==1),]
+info_icu <- info[which(info$ICU_1 ==1),]
+idx = match(df_sub$symbol,names(df_icu))
+subsetDf = df_icu[,idx]
+subsetDf$label = replace(info_icu$COVID,which(info_icu$COVID == 1),"COVID")
+subsetDf$label = replace(subsetDf$label,which(subsetDf$label == 0),"nonCOVID")
+```
+
+Create cross-validated random forest model using predictors selected from DE analysis.
+```{r}
+library(caret)
+library(data.table)
+library(randomForest)
+predictionsCVRF <- matrix(0,nrow=dim(subsetDf)[1],ncol=2)
+rownames(predictionsCVRF) <- rownames(subsetDf)
+folds <- createFolds(subsetDf$label,10)
+for(fold in folds){
+  valids <- subsetDf[fold,]
+  trains <- subsetDf[setdiff(1:dim(subsetDf)[1],fold),]
+  
+  #Perform DE Analysis on the training folds
+  training_DE <- data.frame(Gene = colnames(trains), t.test=NA, p.val=NA, log2FC=NA)
+  covid_samples <- grep('^C', row.names(trains))
+  noncovid_samples <- grep('^NC', row.names(trains))
+  n <- ncol(trains)-1
+  for(i in 1:n){
+    res <- t.test(trains[covid_samples,i], trains[noncovid_samples,i])
+    training_DE$t.test[i] <- res$statistic
+    training_DE$p.val[i] <- res$p.value
+    training_DE$log2FC[i] <- log2(mean(trains[covid_samples,i])/mean(trains[noncovid_samples,i]))
+  }
+  training_DE$adj.p.val <- p.adjust(training_DE$p.val)
+  training_DE_genes <- training_DE$Gene[which(training_DE$adj.p.val<0.05 & abs(training_DE$log2FC) > 1)]  
+  df_DE_genes_names <- data.frame(training_DE_genes)
+  colnames(df_DE_genes_names) <- 'symbol'
+  
+  trains = as.matrix.data.frame(trains)
+  trains = data.frame(t(trains))
+  setDT(trains, keep.rownames = TRUE)[]
+  colnames(trains)[1] = 'symbol'
+  geneDESubset <- merge(trains,df_DE_genes_names,by='symbol')
+  trains = as.data.frame(t(geneDESubset))
+  names(trains) = as.matrix(trains[1,])
+  trains = trains[-1,]
+  trains[] <- lapply(trains,function(x) as.numeric(as.character(x)))
+  trains$label = 0
+  trains[covid_samples,]$label = "COVID"
+  trains[noncovid_samples,]$label = "nonCOVID"
+  trains$label <- as.factor(trains$label)
+
+  valids = as.matrix.data.frame(valids)
+  valids = data.frame(t(valids))
+  setDT(valids, keep.rownames = TRUE)[]
+  colnames(valids)[1] = 'symbol'
+  geneDESubsetValids <- merge(valids,df_DE_genes_names,by='symbol')
+  valids = as.data.frame(t(geneDESubsetValids))
+  names(valids) = as.matrix(valids[1,])
+  valids = valids[-1,]
+  valids[] <- lapply(valids,function(x) as.numeric(as.character(x)))
+  valids$label = 0
+  covid_samples_valids <- grep('^C', row.names(valids))
+  noncovid_samples_valids <- grep('^NC', row.names(valids))
+  valids[covid_samples_valids,]$label = "COVID"
+  valids[noncovid_samples_valids,]$label = "nonCOVID"
+  valids$label <- as.factor(valids$label)
+
+  #Create a random forest model using the predictors from DE analysis
+
+  tmpRF <- randomForest(label ~ . ,data=trains,importance=T,ntree=1000,nodesize=5)
+  predicted <- predict(tmpRF,valids,type='prob')
+  predictionsCVRF[rownames(predicted),] <- predictionsCVRF[rownames(predicted),]+predicted
+}
+colnames(predictionsCVRF) <- colnames(predicted)
+
+predicts <- t(apply(predictionsCVRF,1,function(v){v/sum(v)}))
+colnames(predicts) <- colnames(predicted)
+predicts <- data.frame(predicts,check.names=F)
+predicts$predicted <- apply(predicts,1,function(v){names(v)[max(v)==v]})
+predicts$observed <- subsetDf$label
+predicts
+```
+
+Accuracy of Random Forest Cross Validation
+```{r}
+accuracy <- sum(as.matrix(predicts$predicted == predicts$observed))
+accuracy/nrow(predicts)
+tp = sum(as.matrix(predicts$predicted == "COVID" & predicts$observed == "COVID"))
+tn = sum(as.matrix(predicts$predicted == "nonCOVID" & predicts$observed == "nonCOVID"))
+fn = sum(as.matrix(predicts$predicted == "nonCOVID" & predicts$observed == "COVID"))
+fp = sum(as.matrix(predicts$predicted == "COVID" & predicts$observed == "nonCOVID"))
+
+predicts$p
+```
+
+Create cross-validated xgboost model using predictors selected from DE analysis.
+```{r}
+library(xgboost)
+predictionsXGBCV <- matrix(0,nrow=dim(subsetDf)[1],ncol=2)
+rownames(predictionsXGBCV) <- rownames(subsetDf)
+folds <- createFolds(subsetDf$label,10)
+for(fold in folds){
+  valids <- subsetDf[fold,]
+  trains <- subsetDf[setdiff(1:dim(subsetDf)[1],fold),]
+  
+  #Perform DE Analysis on the training folds
+  training_DE <- data.frame(Gene = colnames(trains), t.test=NA, p.val=NA, log2FC=NA)
+  covid_samples <- grep('^C', row.names(trains))
+  noncovid_samples <- grep('^NC', row.names(trains))
+  n <- ncol(trains)-1
+  for(i in 1:n){
+    res <- t.test(trains[covid_samples,i], trains[noncovid_samples,i])
+    training_DE$t.test[i] <- res$statistic
+    training_DE$p.val[i] <- res$p.value
+    training_DE$log2FC[i] <- log2(mean(trains[covid_samples,i])/mean(trains[noncovid_samples,i]))
+  }
+  training_DE$adj.p.val <- p.adjust(training_DE$p.val)
+  training_DE_genes <- training_DE$Gene[which(training_DE$adj.p.val<0.05 & abs(training_DE$log2FC) > 1)]  
+  df_DE_genes_names <- data.frame(training_DE_genes)
+  colnames(df_DE_genes_names) <- 'symbol'
+  
+  trains = as.matrix.data.frame(trains)
+  trains = data.frame(t(trains))
+  setDT(trains, keep.rownames = TRUE)[]
+  colnames(trains)[1] = 'symbol'
+  geneDESubset <- merge(trains,df_DE_genes_names,by='symbol')
+  trains = as.data.frame(t(geneDESubset))
+  names(trains) = as.matrix(trains[1,])
+  trains = trains[-1,]
+  trains[] <- lapply(trains,function(x) as.numeric(as.character(x)))
+  trains$label = 0
+  trains[covid_samples,]$label = "COVID"
+  trains[noncovid_samples,]$label = "nonCOVID"
+  trains$label <- as.factor(trains$label)
+
+  valids = as.matrix.data.frame(valids)
+  valids = data.frame(t(valids))
+  setDT(valids, keep.rownames = TRUE)[]
+  colnames(valids)[1] = 'symbol'
+  geneDESubsetValids <- merge(valids,df_DE_genes_names,by='symbol')
+  valids = as.data.frame(t(geneDESubsetValids))
+  names(valids) = as.matrix(valids[1,])
+  valids = valids[-1,]
+  valids[] <- lapply(valids,function(x) as.numeric(as.character(x)))
+  valids$label = 0
+  covid_samples_valids <- grep('^C', row.names(valids))
+  noncovid_samples_valids <- grep('^NC', row.names(valids))
+  valids[covid_samples_valids,]$label = "COVID"
+  valids[noncovid_samples_valids,]$label = "nonCOVID"
+  valids$label <- as.factor(valids$label)
+
+  #Create a xgb model using the predictors from DE analysis
+  dataTrainMatrix = data.matrix(trains[, colnames(trains) != "label" ])
+  labelTrainMatrix = data.matrix(as.numeric(trains$label == "COVID"))
+  dataValidationMatrix = data.matrix(valids[, colnames(valids) != "label" ])
+	tmpXGB <- xgboost(data=dataTrainMatrix,label=labelTrainMatrix, objective="binary:logistic",nrounds=5)
+  predicted <- predict(tmpXGB,dataValidationMatrix,type='prob')
+  predictionsXGBCV[rownames(valids),] <- predictionsXGBCV[rownames(valids),]+predicted
+}
+predictionsXGBCV = as.data.frame(predictionsXGBCV)
+colnames(predictionsXGBCV) <- c("VAL1","VAL2")
+predictionsXGBCV$Observed = subsetDf$label
+predictionsXGBCV$Predicted = lapply(predictionsXGBCV$VAL1, function(x) ifelse(x>0.5, "COVID","nonCOVID"))
+v
+predictionsXGBCV
+```
+
+
+Accuracy of xgboost Cross Validation
+```{r}
+accuracy <- sum(as.matrix(predictionsXGBCV$Predicted == predictionsXGBCV$Observed))
+accuracy/nrow(predictionsXGBCV)
+tp = sum(as.matrix(predictionsXGBCV$Predicted == "COVID" & predictionsXGBCV$Observed == "COVID"))
+tn = sum(as.matrix(predictionsXGBCV$Predicted == "nonCOVID" & predictionsXGBCV$Observed == "nonCOVID"))
+fn = sum(as.matrix(predictionsXGBCV$Predicted == "nonCOVID" & predictionsXGBCV$Observed == "COVID"))
+fp = sum(as.matrix(predictionsXGBCV$Predicted == "COVID" & predictionsXGBCV$Observed == "nonCOVID"))
+```
+
+We have established that both models generalize well from training to testing data. Now, we will test how well a model trained from a calibrated data set performs on testing data both from the same calibrated data set and the data set it has been calibrated with.
+
+
+Perform DE Analysis on Training Set
+80% of GSE157103 will be used as training, 20% as testing
+```{r}
+library(caret)
+split <- createDataPartition(subsetDf$label,list=FALSE, p=0.8)
+training <- subsetDf[split,]
+test <- subsetDf[-split,]
+
+training_DE <- data.frame(Gene = colnames(training), t.test=NA, p.val=NA, log2FC=NA)
+covid_samples <- grep('^C', row.names(training))
+noncovid_samples <- grep('^NC', row.names(training))
+n <- ncol(training)-1
+for(i in 1:n){
+  res <- t.test(training[covid_samples,i], training[noncovid_samples,i])
+  training_DE$t.test[i] <- res$statistic
+  training_DE$p.val[i] <- res$p.value
+  training_DE$log2FC[i] <- log2(mean(training[covid_samples,i])/mean(training[noncovid_samples,i]))
+}
+training_DE$adj.p.val <- p.adjust(training_DE$p.val)
+training_DE_genes <- training_DE$Gene[which(training_DE$adj.p.val<0.05 & abs(training_DE$log2FC) > 1)]
+
+```
+
+Perform log2 transformation 
+```{r}
+df_DE_genes_names <- data.frame(training_DE_genes)
+colnames(df_DE_genes_names) <- 'symbol'
+geneDESubset <- merge(df_sub,df_DE_genes_names,by='symbol')
+
+GSE157103_control_sub <- merge(GSE157103_icu,geneDESubset['symbol'],by='symbol')
+GSE154998_control_sub <- merge(GSE154998_control,geneDESubset['symbol'],by='symbol')
+trans157103DE <- geneDESubset['symbol']
+for (i in seq(2,17)){
+  v1 <- log2(GSE157103_control_sub[,i]+1)
+  trans157103DE <- cbind(trans157103DE,v1)
+}
+colnames(trans157103DE) <- colnames(GSE157103_icu)
+
+trans154998DE <- geneDESubset['symbol']
+for (i in seq(2,8)){
+  v2 <- log2(GSE154998_control_sub[,i]+1)
+  trans154998DE <- cbind(trans154998DE,v2)
+}
+colnames(trans154998DE) <- colnames(GSE154998_control)
+```
+
+Calibration using Geometric Mean Regression (GMR)
+```{r}
+### GMR equation: GSE157103 = slope * GSE154998 + intercept
+log2_GSE157103_mean <- rowMeans(trans157103DE[,2:17])
+log2_GSE154998_mean <- rowMeans(trans154998DE[,2:8])
+slope <- sd(log2_GSE157103_mean) / sd(log2_GSE154998_mean)
+intercept <- mean(log2_GSE157103_mean) - slope * mean(log2_GSE154998_mean)
+
+# GSE154998 <- merge(data2[,-c(1:4)],geneDESubset['symbol'],by='symbol')
+# GSE154998_calibrated <- geneDESubset['symbol']
+GSE157103 <- merge(data1,geneDESubset['symbol'],by='symbol')
+GSE157103_calibrated <- geneDESubset['symbol']
+for (i in colnames(GSE157103[-1])){
+  temp <- 2 ^ ((log2(GSE157103[i]+1) - intercept) / slope) - 1
+  GSE157103_calibrated <- cbind(GSE157103_calibrated,temp)
+}
+
+write.csv(GSE157103_calibrated,'GSE157103_genes.tpm_calibrated.csv')
+```
+
+Training a random forest model with calibrated GSE157103 training set
+```{r}
+library(caret)
+library(data.table)
+library(randomForest)
+
+GSE157103_calibrated = as.data.frame(t(GSE157103_calibrated))
+names(GSE157103_calibrated) = as.matrix(GSE157103_calibrated[1,])
+GSE157103_calibrated = GSE157103_calibrated[-1,]
+GSE157103_calibrated[] <- lapply(GSE157103_calibrated,function(x) as.numeric(as.character(x)))
+info <- read.csv("patients_info.csv",header = TRUE)
+info <- info[match(row.names(GSE157103_calibrated),info$Albany_sampleID),]
+df_icu <- GSE157103_calibrated[which(info$ICU_1 ==1),]
+info_icu <- info[which(info$ICU_1 ==1),]
+df_icu$label = replace(info_icu$COVID,which(info_icu$COVID == 1),"COVID")
+df_icu$label = replace(df_icu$label,which(df_icu$label == 0),"nonCOVID")
+df_icu$label = as.factor(df_icu$label)
+training = df_icu[split,]
+test = df_icu[-split,]
+
+rfModel <- randomForest(label ~ . ,data=training,importance=T,ntree=1000,nodesize=5)
+predictedGSE157103Test <- predict(rfModel,test,type='prob')
+predictedGSE157103Test = as.data.frame(predictedGSE157103Test)
+predictedGSE157103Test$predicted <- lapply(predictedGSE157103Test$COVID, function(x) ifelse(x>0.5, "COVID","nonCOVID"))
+predictedGSE157103Test$observed <- test$label
+predictedGSE157103Test
+importance = data.frame(rfModel$importance[,4])
+colnames(importance) = c("MeanDecreaseAccuracy")
+```
+
+Accuracy of Calibrated Random Forest Model on Test Data from same Data Set
+```{r}
+accuracy <- sum(as.matrix(predictedGSE157103Test$predicted == predictedGSE157103Test$observed))
+accuracy/nrow(predictedGSE157103Test)
+tp = sum(as.matrix(predictedGSE157103Test$predicted == "COVID" & predictedGSE157103Test$observed == "COVID"))
+tn = sum(as.matrix(predictedGSE157103Test$predicted == "nonCOVID" & predictedGSE157103Test$observed == "nonCOVID"))
+fn = sum(as.matrix(predictedGSE157103Test$predicted == "nonCOVID" & predictedGSE157103Test$observed == "COVID"))
+fp = sum(as.matrix(predictedGSE157103Test$predicted == "COVID" & predictedGSE157103Test$observed == "nonCOVID"))
+```
+
+Testing Accuracy on Different Data Set: GSE154998
+```{r}
+controlDF2 = as.data.frame(t(GSE154998_control))
+names(controlDF2) = as.matrix(controlDF2[1,])
+controlDF2 = controlDF2[-1,]
+controlDF2[] <- lapply(controlDF2,function(x) as.numeric(as.character(x)))
+controlDF2$label = "nonCOVID"
+
+covidDF2 = as.data.frame(t(GSE154998_covid))
+names(covidDF2) = as.matrix(covidDF2[1,])
+covidDF2 = covidDF2[-1,]
+covidDF2[] <- lapply(covidDF2,function(x) as.numeric(as.character(x)))
+covidDF2$label = "COVID"
+
+testDF2 = rbind(covidDF2,controlDF2)
+
+
+predictedGSE154998 <- predict(rfModel,testDF2,type='prob')
+predictedGSE154998 = as.data.frame(predictedGSE154998)
+predictedGSE154998$predicted <- lapply(predictedGSE154998$COVID, function(x) ifelse(x>0.5, "COVID","nonCOVID"))
+predictedGSE154998$observed <- testDF2$label
+predictedGSE154998
+```
+
+Accuracy of Calibrated Random Forest Model on Test Data from Separate Calibrated Data Set
+```{r}
+accuracy <- sum(as.matrix(predictedGSE154998$predicted == predictedGSE154998$observed))
+accuracy/nrow(predictedGSE154998)
+tp = sum(as.matrix(predictedGSE154998$predicted == "COVID" & predictedGSE154998$observed == "COVID"))
+tn = sum(as.matrix(predictedGSE154998$predicted == "nonCOVID" & predictedGSE154998$observed == "nonCOVID"))
+fn = sum(as.matrix(predictedGSE154998$predicted == "nonCOVID" & predictedGSE154998$observed == "COVID"))
+fp = sum(as.matrix(predictedGSE154998$predicted == "COVID" & predictedGSE154998$observed == "nonCOVID"))
+```
+
+Training an xgboost model with calibrated GSE157103 training set
+```{r}
+
+library(xgboost)
+
+training = df_icu[split,]
+test = df_icu[-split,]
+dataTrainMatrix = data.matrix(training[, colnames(training) != "label" ])
+labelTrainMatrix = data.matrix(as.numeric(training$label == "COVID"))
+dataTestGSE157103Matrix = data.matrix(test[, colnames(test) != "label" ])
+xgbModel <- xgboost(data=dataTrainMatrix,label=labelTrainMatrix, objective="binary:logistic",nrounds=5)
+
+predictedGSE157103TestXGB <- predict(xgbModel,dataTestGSE157103Matrix,type='prob')
+predictedGSE157103TestXGB = as.data.frame(predictedGSE157103TestXGB)
+predictedGSE157103TestXGB$predicted <- lapply(predictedGSE157103TestXGB[,1], function(x) ifelse(x>0.5, "COVID","nonCOVID"))
+predictedGSE157103TestXGB$observed <- test$label
+predictedGSE157103TestXGB
+```
+
+Accuracy of Calibrated xgboost Model on Test Data from same Data Set
+```{r}
+accuracy <- sum(as.matrix(predictedGSE157103TestXGB$predicted == predictedGSE157103TestXGB$observed))
+accuracy/nrow(predictedGSE157103TestXGB)
+tp = sum(as.matrix(predictedGSE157103TestXGB$predicted == "COVID" & predictedGSE157103TestXGB$observed == "COVID"))
+tn = sum(as.matrix(predictedGSE157103TestXGB$predicted == "nonCOVID" & predictedGSE157103TestXGB$observed == "nonCOVID"))
+fn = sum(as.matrix(predictedGSE157103TestXGB$predicted == "nonCOVID" & predictedGSE157103TestXGB$observed == "COVID"))
+fp = sum(as.matrix(predictedGSE157103TestXGB$predicted == "COVID" & predictedGSE157103TestXGB$observed == "nonCOVID"))
+```
+
+Testing Accuracy of xgboost model on Different Data Set: GSE154998
+```{r}
+
+dataTestGSE154998 = data.matrix(testDF2[,names(GSE157103_calibrated)])
+predictedGSE154998XGB <- predict(xgbModel,dataTestGSE154998,type='prob')
+predictedGSE154998XGB = as.data.frame(predictedGSE154998XGB)
+predictedGSE154998XGB$predicted <- lapply(predictedGSE154998XGB[,1], function(x) ifelse(x>0.5, "COVID","nonCOVID"))
+predictedGSE154998XGB$observed <- testDF2$label
+predictedGSE154998XGB
+```
+
+Accuracy of Calibrated xgboost Model on Test Data from Calibrated Second Data Set
+```{r}
+accuracy <- sum(as.matrix(predictedGSE154998XGB$predicted == predictedGSE154998XGB$observed))
+accuracy/nrow(predictedGSE154998XGB)
+tp = sum(as.matrix(predictedGSE154998XGB$predicted == "COVID" & predictedGSE154998XGB$observed == "COVID"))
+tn = sum(as.matrix(predictedGSE154998XGB$predicted == "nonCOVID" & predictedGSE154998XGB$observed == "nonCOVID"))
+fn = sum(as.matrix(predictedGSE154998XGB$predicted == "nonCOVID" & predictedGSE154998XGB$observed == "COVID"))
+fp = sum(as.matrix(predictedGSE154998XGB$predicted == "COVID" & predictedGSE154998XGB$observed == "nonCOVID"))
+```
