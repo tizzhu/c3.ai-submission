@@ -8,7 +8,11 @@ Select only genes that have same mean difference direction in both data sets.
 ```{r}
 setwd("~/Desktop/COVIDCompetition")
 set.seed(2020.4)
-data1 <- read.delim("GSE157103_genes.tpm.tsv",header = TRUE,sep = "\t")
+df157103 <- read.delim('GSE157103_genes.ec.tsv',header = TRUE,sep = "\t",row.names = 1)
+library(edgeR)
+df157103_dgelist <- DGEList(df157103)
+df157103_dgelist <- calcNormFactors(df157103_dgelist, method = 'TMM')
+data1 <- cpm(df157103_dgelist)
 data2 <- read.table(file = 'GSE154998_normalized_read_counts.txt', sep = '\t', header = TRUE)
 colnames(data1)[1] = 'symbol'
 colnames(data2)[5] = 'symbol'
