@@ -278,16 +278,28 @@ log2_GSE154998_mean <- rowMeans(trans154998DE[,2:8])
 slope <- sd(log2_GSE157103_mean) / sd(log2_GSE154998_mean)
 intercept <- mean(log2_GSE157103_mean) - slope * mean(log2_GSE154998_mean)
 
-# GSE154998 <- merge(data2[,-c(1:4)],geneDESubset['symbol'],by='symbol')
-# GSE154998_calibrated <- geneDESubset['symbol']
-GSE157103 <- merge(data1,geneDESubset['symbol'],by='symbol')
-GSE157103_calibrated <- geneDESubset['symbol']
-for (i in colnames(GSE157103[-1])){
-  temp <- 2 ^ ((log2(GSE157103[i]+1) - intercept) / slope) - 1
-  GSE157103_calibrated <- cbind(GSE157103_calibrated,temp)
-}
+ggplot(data.frame(log2_GSE157103_mean,log2_GSE154998_mean), aes(x = log2_GSE154998_mean, y = log2_GSE157103_mean))+
+  geom_point()+
+  geom_abline(intercept = intercept, slope = slope)+
+  geom_abline(intercept = 0, slope = 1, color="blue",linetype='dashed')+
+  labs(title="Scatter plot of gene mean expression")+
+  geom_text(x = 6.5, y = 7.5, label = "y = 1.004x + 0.137") + 
+  geom_text(x = 7.5, y = 6, label = "y = x", color='blue')+
+  theme_classic()
+ggsave("GMR_fit.jpeg")
 
-write.csv(GSE157103_calibrated,'GSE157103_genes.tpm_calibrated.csv')
+GSE154998 <- merge(data2[,-c(1:4)],geneDESubset['symbol'],by='symbol')
+GSE154998_calibrated <- geneDESubset['symbol']
+for (i in colnames(GSE154998[-1])){
+  temp <- 2 ^ (slope * log2(GSE154998[i]+1) + intercept) - 1
+  GSE154998_calibrated <- cbind(GSE154998_calibrated,temp)
+}
+GSE157103 <- merge(data1,geneDESubset['symbol'],by='symbol')
+GSE157103_training = GSE157103[,split]
+GSE157103_test = GSE157103[,-split]
+write.csv(GSE157103_training,'GSE157103_training.csv')
+write.csv(GSE157103_test,'GSE157103_test.csv')
+write.csv(GSE154998_calibrated,'GSE154998_calibrated.csv')
 ```
 
 Training a random forest model with calibrated GSE157103 training set
